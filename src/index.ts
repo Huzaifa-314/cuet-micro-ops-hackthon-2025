@@ -585,7 +585,15 @@ app.openapi(downloadInitiateRoute, async (c) => {
     updatedAt: new Date(),
   };
   
+  // Store in memory cache
   jobs.set(jobId, jobStatus);
+  
+  // Persist to database
+  try {
+    dbOperations.insertJob(jobStatus);
+  } catch (dbError) {
+    console.error(`[Database] Failed to insert job ${jobId}:`, dbError);
+  }
 
   // Start background processing (non-blocking)
   processDownloadJob(jobId, validKeys).catch((error) => {
@@ -597,14 +605,16 @@ app.openapi(downloadInitiateRoute, async (c) => {
       job.updatedAt = new Date();
       
       // Update SQLite
-      try {
-        dbOperations.updateJob(jobId, {
-          status: "failed",
-          error: job.error,
-          updatedAt: job.updatedAt,
-        });
-      } catch (dbError) {
-        console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+      if (dbOperations) {
+        try {
+          dbOperations.updateJob(jobId, {
+            status: "failed",
+            error: job.error,
+            updatedAt: job.updatedAt,
+          });
+        } catch (dbError) {
+          console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+        }
       }
     }
   });
@@ -645,13 +655,15 @@ async function processDownloadJob(jobId: string, fileKeys: string[]): Promise<vo
   job.updatedAt = new Date();
   
   // Update SQLite
-  try {
-    dbOperations.updateJob(jobId, {
-      status: "processing",
-      updatedAt: job.updatedAt,
-    });
-  } catch (error) {
-    console.error(`[Database] Failed to update job ${jobId}:`, error);
+  if (dbOperations) {
+    try {
+      dbOperations.updateJob(jobId, {
+        status: "processing",
+        updatedAt: job.updatedAt,
+      });
+    } catch (error) {
+      console.error(`[Database] Failed to update job ${jobId}:`, error);
+    }
   }
 
   const tempFiles: Array<{ key: string; data: Buffer; checksum: string }> = [];
@@ -700,14 +712,16 @@ async function processDownloadJob(jobId: string, fileKeys: string[]): Promise<vo
         console.log(`[Download] Job ${jobId}: Collected ${i + 1}/${fileKeys.length} files (${job.progress}%)`);
         
         // Update SQLite
-        try {
-          dbOperations.updateJob(jobId, {
-            progress: job.progress,
-            filesCompleted: job.filesCompleted,
-            updatedAt: job.updatedAt,
-          });
-        } catch (dbError) {
-          console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+        if (dbOperations) {
+          try {
+            dbOperations.updateJob(jobId, {
+              progress: job.progress,
+              filesCompleted: job.filesCompleted,
+              updatedAt: job.updatedAt,
+            });
+          } catch (dbError) {
+            console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+          }
         }
       } catch (error) {
         console.error(`[Download] Job ${jobId}: Failed to collect file ${key}:`, error);
@@ -733,10 +747,16 @@ async function processDownloadJob(jobId: string, fileKeys: string[]): Promise<vo
     job.updatedAt = new Date();
     
     // Update SQLite
-    dbOperations.updateJob(jobId, {
-      progress: 30,
-      updatedAt: job.updatedAt,
-    });
+    if (dbOperations) {
+      try {
+        dbOperations.updateJob(jobId, {
+          progress: 30,
+          updatedAt: job.updatedAt,
+        });
+      } catch (dbError) {
+        console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+      }
+    }
 
     // Create ZIP archive in memory
     const archive = archiver("zip", {
@@ -777,10 +797,16 @@ async function processDownloadJob(jobId: string, fileKeys: string[]): Promise<vo
     job.updatedAt = new Date();
     
     // Update SQLite
-    dbOperations.updateJob(jobId, {
-      progress: 50,
-      updatedAt: job.updatedAt,
-    });
+    if (dbOperations) {
+      try {
+        dbOperations.updateJob(jobId, {
+          progress: 50,
+          updatedAt: job.updatedAt,
+        });
+      } catch (dbError) {
+        console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+      }
+    }
     
     console.log(`[Download] Job ${jobId}: Created archive (${archiveBuffer.length} bytes)`);
 
@@ -841,15 +867,17 @@ async function processDownloadJob(jobId: string, fileKeys: string[]): Promise<vo
     job.updatedAt = new Date();
     
     // Update SQLite
-    try {
-      dbOperations.updateJob(jobId, {
-        status: "completed",
-        progress: 100,
-        downloadUrl: downloadUrl,
-        updatedAt: job.updatedAt,
-      });
-    } catch (dbError) {
-      console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+    if (dbOperations) {
+      try {
+        dbOperations.updateJob(jobId, {
+          status: "completed",
+          progress: 100,
+          downloadUrl: downloadUrl,
+          updatedAt: job.updatedAt,
+        });
+      } catch (dbError) {
+        console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+      }
     }
 
     console.log(`[Download] Job ${jobId} completed successfully. Download URL generated.`);
@@ -859,14 +887,16 @@ async function processDownloadJob(jobId: string, fileKeys: string[]): Promise<vo
     job.updatedAt = new Date();
     
     // Update SQLite
-    try {
-      dbOperations.updateJob(jobId, {
-        status: "failed",
-        error: job.error,
-        updatedAt: job.updatedAt,
-      });
-    } catch (dbError) {
-      console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+    if (dbOperations) {
+      try {
+        dbOperations.updateJob(jobId, {
+          status: "failed",
+          error: job.error,
+          updatedAt: job.updatedAt,
+        });
+      } catch (dbError) {
+        console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+      }
     }
     
     console.error(`[Download] Job ${jobId} failed:`, error);
@@ -1156,7 +1186,7 @@ app.get("/v1/download/subscribe/:jobId", async (c) => {
   return streamSSE(c, async (stream) => {
     // Try memory cache first, then SQLite
     let job = jobs.get(jobId);
-    if (!job) {
+    if (!job && dbOperations) {
       job = dbOperations.getJob(jobId);
       if (job) {
         jobs.set(jobId, job);
@@ -1226,10 +1256,94 @@ app.get("/v1/download/subscribe/:jobId", async (c) => {
   });
 });
 
+// List all jobs endpoint
+app.get("/v1/download/jobs", (c) => {
+  try {
+    // Get all jobs from database (includes both in-memory and persisted jobs)
+    if (!dbOperations) {
+      // Database not initialized yet, return in-memory jobs only
+      const jobsArray = Array.from(jobs.values());
+      return c.json({
+        jobs: jobsArray.map((job) => ({
+          jobId: job.jobId,
+          status: job.status,
+          progress: job.progress,
+          filesCompleted: job.filesCompleted,
+          totalFiles: job.totalFiles,
+          downloadUrl: job.downloadUrl,
+          error: job.error,
+          fileKeys: job.fileKeys,
+          createdAt: job.createdAt.toISOString(),
+          updatedAt: job.updatedAt.toISOString(),
+        })),
+        total: jobsArray.length,
+      });
+    }
+    
+    const allJobs = dbOperations.getAllJobs(100, 0);
+    
+    // Merge with in-memory cache (in-memory takes precedence for active jobs)
+    const jobMap = new Map<string, JobStatus>();
+    
+    // First, add all jobs from database
+    for (const dbJob of allJobs) {
+      jobMap.set(dbJob.jobId, {
+        jobId: dbJob.jobId,
+        status: dbJob.status,
+        fileKeys: dbJob.fileKeys,
+        progress: dbJob.progress,
+        filesCompleted: dbJob.filesCompleted,
+        totalFiles: dbJob.totalFiles,
+        downloadUrl: dbJob.downloadUrl,
+        error: dbJob.error,
+        createdAt: dbJob.createdAt,
+        updatedAt: dbJob.updatedAt,
+      });
+    }
+    
+    // Then, update with in-memory cache (for active/current jobs)
+    for (const [jobId, job] of jobs.entries()) {
+      jobMap.set(jobId, job);
+    }
+    
+    // Convert to array and format for frontend
+    const jobsArray = Array.from(jobMap.values()).map((job) => ({
+      jobId: job.jobId,
+      status: job.status,
+      progress: job.progress,
+      filesCompleted: job.filesCompleted,
+      totalFiles: job.totalFiles,
+      downloadUrl: job.downloadUrl,
+      error: job.error,
+      fileKeys: job.fileKeys,
+      createdAt: job.createdAt.toISOString(),
+      updatedAt: job.updatedAt.toISOString(),
+    }));
+    
+    // Sort by most recent first
+    jobsArray.sort((a, b) => 
+      new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+    
+    return c.json({ jobs: jobsArray }, 200);
+  } catch (error) {
+    console.error("Error fetching jobs:", error);
+    return c.json({ error: "Failed to fetch jobs", jobs: [] }, 500);
+  }
+});
+
 // Status endpoint for polling
 app.get("/v1/download/status/:jobId", (c) => {
   const jobId = c.req.param("jobId");
-  const job = jobs.get(jobId);
+  
+  // Try memory cache first, then database
+  let job = jobs.get(jobId);
+  if (!job) {
+    job = dbOperations.getJob(jobId);
+    if (job) {
+      jobs.set(jobId, job);
+    }
+  }
   
   if (!job) {
     return c.json({ error: "Job not found" }, 404);

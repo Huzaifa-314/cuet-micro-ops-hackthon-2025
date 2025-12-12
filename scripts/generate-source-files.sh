@@ -77,3 +77,4 @@ echo "📊 Total size: $(du -sh "$SOURCE_DIR" | cut -f1)"
 echo ""
 ls -lh "$SOURCE_DIR"
 
+
