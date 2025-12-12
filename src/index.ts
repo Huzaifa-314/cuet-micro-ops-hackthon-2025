@@ -79,6 +79,7 @@ const app = new OpenAPIHono();
 // Request ID middleware - adds unique ID to each request
 app.use(async (c, next) => {
   const requestId = c.req.header("x-request-id") ?? crypto.randomUUID();
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-member-access, @typescript-eslint/no-unsafe-call, @typescript-eslint/no-explicit-any
   (c as any).set("requestId", requestId);
   c.header("x-request-id", requestId);
   await next();
