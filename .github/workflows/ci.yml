@@ -171,14 +171,19 @@ jobs:
 
       - name: 📦 Copy files to server
         run: |
+          DEPLOY_DIR="${{ secrets.SERVER_DEPLOY_PATH }}/cuet-micro-ops-hackthon-2025"
           ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
-            "mkdir -p ${{ secrets.SERVER_DEPLOY_PATH }}"
-          scp -r ./* ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.SERVER_DEPLOY_PATH }}/
+            "mkdir -p $DEPLOY_DIR"
+          scp -r ./* ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:$DEPLOY_DIR/
 
       - name: 🐳 Deploy on server
         run: |
           ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
             cd ${{ secrets.SERVER_DEPLOY_PATH }}/cuet-micro-ops-hackthon-2025
+            echo "Current directory: $(pwd)"
+            echo "Checking if docker/compose.prod.yml exists..."
+            ls -la docker/compose.prod.yml || echo "File not found, listing docker directory:"
+            ls -la docker/ || echo "Docker directory not found"
             docker compose -f docker/compose.prod.yml down || true
             docker compose -f docker/compose.prod.yml pull || true
             docker compose -f docker/compose.prod.yml up -d --build
