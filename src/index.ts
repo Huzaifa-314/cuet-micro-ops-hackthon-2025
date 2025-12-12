@@ -79,7 +79,7 @@ const app = new OpenAPIHono();
 // Request ID middleware - adds unique ID to each request
 app.use(async (c, next) => {
   const requestId = c.req.header("x-request-id") ?? crypto.randomUUID();
-  c.set("requestId", requestId);
+  (c as any).set("requestId", requestId);
   c.header("x-request-id", requestId);
   await next();
 });
@@ -144,7 +144,9 @@ const ErrorResponseSchema = z
 // Error handler with Sentry
 app.onError((err, c) => {
   c.get("sentry").captureException(err);
-  const requestId = c.get("requestId") as string | undefined;
+  const requestId =
+    (c.get("requestId" as never) as string | undefined) ??
+    c.req.header("x-request-id");
   return c.json(
     {
       error: "Internal Server Error",

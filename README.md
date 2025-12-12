@@ -543,6 +543,7 @@ npm run docker:prod  # Start with Docker (production)
 ### For Contributors
 
 1. **Before pushing**, run tests locally:
+
    ```bash
    npm run lint
    npm run format:check
@@ -583,6 +584,7 @@ The pipeline automatically deploys to the Ubuntu server when code is pushed to t
 3. Runs `docker compose` to update the running services
 
 **Required GitHub Secrets:**
+
 - `SERVER_HOST` - Server IP or hostname
 - `SERVER_USER` - SSH username (usually `ubuntu`)
 - `SERVER_SSH_KEY` - Private SSH key for authentication
