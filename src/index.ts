@@ -1,4 +1,8 @@
-import { HeadObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { HeadObjectCommand, ListObjectsV2Command, GetObjectCommand, PutObjectCommand, CopyObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
+import { createHash } from "crypto";
+import archiver from "archiver";
+import { Readable } from "stream";
 import { serve } from "@hono/node-server";
 import type { ServerType } from "@hono/node-server";
 import { httpInstrumentationMiddleware } from "@hono/otel";
@@ -13,6 +17,9 @@ import { cors } from "hono/cors";
 import { secureHeaders } from "hono/secure-headers";
 import { timeout } from "hono/timeout";
 import { rateLimiter } from "hono-rate-limiter";
+import { streamSSE } from "hono/streaming";
+// Import database operations
+import { dbOperations } from "./db/database.js";
 
 // Helper for optional URL that treats empty string as undefined
 const optionalUrl = z
@@ -51,10 +58,36 @@ const EnvSchema = z.object({
 // Parse and validate environment
 const env = EnvSchema.parse(process.env);
 
-// S3 Client
+// S3 Client for internal operations (uses Docker service name)
 const s3Client = new S3Client({
   region: env.S3_REGION,
   ...(env.S3_ENDPOINT && { endpoint: env.S3_ENDPOINT }),
+  ...(env.S3_ACCESS_KEY_ID &&
+    env.S3_SECRET_ACCESS_KEY && {
+      credentials: {
+        accessKeyId: env.S3_ACCESS_KEY_ID,
+        secretAccessKey: env.S3_SECRET_ACCESS_KEY,
+      },
+    }),
+  forcePathStyle: env.S3_FORCE_PATH_STYLE,
+});
+
+// S3 Client for browser-accessible presigned URLs (uses localhost)
+// This ensures presigned URLs work in browsers
+// Replace Docker internal hostname with localhost for browser access
+const getBrowserEndpoint = (): string => {
+  if (!env.S3_ENDPOINT) return "http://localhost:9000";
+  // Replace internal Docker hostnames with localhost
+  return env.S3_ENDPOINT
+    .replace(/http:\/\/delineate-minio:9000/, "http://localhost:9000")
+    .replace(/http:\/\/minio:9000/, "http://localhost:9000")
+    .replace(/delineate-minio:9000/, "localhost:9000")
+    .replace(/minio:9000/, "localhost:9000");
+};
+
+const browserS3Client = new S3Client({
+  region: env.S3_REGION,
+  endpoint: getBrowserEndpoint(),
   ...(env.S3_ACCESS_KEY_ID &&
     env.S3_SECRET_ACCESS_KEY && {
       credentials: {
@@ -177,14 +210,31 @@ const HealthResponseSchema = z
   })
   .openapi("HealthResponse");
 
+// Job status storage (in-memory cache + SQLite persistence)
+interface JobStatus {
+  jobId: string;
+  status: "queued" | "processing" | "completed" | "failed";
+  fileKeys: string[];
+  progress: number;
+  filesCompleted: number;
+  totalFiles: number;
+  downloadUrl?: string;
+  error?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// In-memory cache for fast access (also persisted to SQLite)
+const jobs = new Map<string, JobStatus>();
+
 // Download API Schemas
 const DownloadInitiateRequestSchema = z
   .object({
-    file_ids: z
-      .array(z.number().int().min(10000).max(100000000))
+    file_keys: z
+      .array(z.string().min(1))
       .min(1)
-      .max(1000)
-      .openapi({ description: "Array of file IDs (10K to 100M)" }),
+      .max(100)
+      .openapi({ description: "Array of file keys from source bucket" }),
   })
   .openapi("DownloadInitiateRequest");
 
@@ -192,7 +242,9 @@ const DownloadInitiateResponseSchema = z
   .object({
     jobId: z.string().openapi({ description: "Unique job identifier" }),
     status: z.enum(["queued", "processing"]),
-    totalFileIds: z.number().int(),
+    totalFiles: z.number().int(),
+    subscribeUrl: z.string().openapi({ description: "SSE endpoint for progress updates" }),
+    statusUrl: z.string().openapi({ description: "Polling endpoint for job status" }),
   })
   .openapi("DownloadInitiateResponse");
 
@@ -492,18 +544,338 @@ const downloadCheckRoute = createRoute({
   },
 });
 
-app.openapi(downloadInitiateRoute, (c) => {
-  const { file_ids } = c.req.valid("json");
+app.openapi(downloadInitiateRoute, async (c) => {
+  const { file_keys } = c.req.valid("json");
+  
+  // Validate file keys exist in source bucket
+  const validKeys: string[] = [];
+  for (const key of file_keys) {
+    try {
+      const command = new HeadObjectCommand({
+        Bucket: "source",
+        Key: key,
+      });
+      await s3Client.send(command);
+      validKeys.push(key);
+    } catch {
+      // Skip invalid keys
+      console.warn(`[Download] File key not found in source bucket: ${key}`);
+    }
+  }
+
+  if (validKeys.length === 0) {
+    return c.json(
+      { error: "Validation Error", message: "No valid file keys found in source bucket" },
+      400,
+    );
+  }
+
+  // Generate unique jobId
   const jobId = crypto.randomUUID();
+  
+  // Create job status
+  const jobStatus: JobStatus = {
+    jobId,
+    status: "queued",
+    fileKeys: validKeys,
+    progress: 0,
+    filesCompleted: 0,
+    totalFiles: validKeys.length,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  };
+  
+  jobs.set(jobId, jobStatus);
+
+  // Start background processing (non-blocking)
+  processDownloadJob(jobId, validKeys).catch((error) => {
+    console.error(`[Download] Job ${jobId} failed:`, error);
+    const job = jobs.get(jobId);
+    if (job) {
+      job.status = "failed";
+      job.error = error instanceof Error ? error.message : "Unknown error";
+      job.updatedAt = new Date();
+      
+      // Update SQLite
+      try {
+        dbOperations.updateJob(jobId, {
+          status: "failed",
+          error: job.error,
+          updatedAt: job.updatedAt,
+        });
+      } catch (dbError) {
+        console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+      }
+    }
+  });
+
+  // Return immediately (< 1 second)
   return c.json(
     {
       jobId,
       status: "queued" as const,
-      totalFileIds: file_ids.length,
+      totalFiles: validKeys.length,
+      subscribeUrl: `/v1/download/subscribe/${jobId}`,
+      statusUrl: `/v1/download/status/${jobId}`,
     },
     200,
   );
 });
+
+// Helper: Stream S3 object to buffer
+async function streamToBuffer(stream: Readable): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
+}
+
+// Helper: Calculate file checksum
+function calculateChecksum(data: Buffer): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+// Background job processing - implements all 4 phases from ARCHITECTURE.md
+async function processDownloadJob(jobId: string, fileKeys: string[]): Promise<void> {
+  const job = jobs.get(jobId);
+  if (!job) return;
+
+  job.status = "processing";
+  job.updatedAt = new Date();
+  
+  // Update SQLite
+  try {
+    dbOperations.updateJob(jobId, {
+      status: "processing",
+      updatedAt: job.updatedAt,
+    });
+  } catch (error) {
+    console.error(`[Database] Failed to update job ${jobId}:`, error);
+  }
+
+  const tempFiles: Array<{ key: string; data: Buffer; checksum: string }> = [];
+
+  try {
+    // ============================================================
+    // Phase 1: File Collection
+    // ============================================================
+    console.log(`[Download] Job ${jobId}: Phase 1 - Collecting files from source bucket...`);
+    
+    for (let i = 0; i < fileKeys.length; i++) {
+      const key = fileKeys[i];
+      
+      try {
+        // Download file from source bucket
+        const getCommand = new GetObjectCommand({
+          Bucket: "source",
+          Key: key,
+        });
+        
+        const response = await s3Client.send(getCommand);
+        
+        if (!response.Body) {
+          throw new Error(`File ${key} has no body`);
+        }
+
+        // Convert stream to buffer
+        const fileData = await streamToBuffer(response.Body as Readable);
+        
+        // Verify file exists and is accessible (has data)
+        if (fileData.length === 0) {
+          throw new Error(`File ${key} is empty`);
+        }
+
+        // Calculate checksum for integrity verification
+        const checksum = calculateChecksum(fileData);
+        
+        // Store temporarily in memory (in production, use temp files or Redis)
+        tempFiles.push({ key, data: fileData, checksum });
+        
+        // Update progress (Phase 1: 0-25%)
+        job.filesCompleted = i + 1;
+        job.progress = Math.round(((i + 1) / fileKeys.length) * 25);
+        job.updatedAt = new Date();
+        
+        console.log(`[Download] Job ${jobId}: Collected ${i + 1}/${fileKeys.length} files (${job.progress}%)`);
+        
+        // Update SQLite
+        try {
+          dbOperations.updateJob(jobId, {
+            progress: job.progress,
+            filesCompleted: job.filesCompleted,
+            updatedAt: job.updatedAt,
+          });
+        } catch (dbError) {
+          console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+        }
+      } catch (error) {
+        console.error(`[Download] Job ${jobId}: Failed to collect file ${key}:`, error);
+        throw new Error(`Failed to collect file ${key}: ${error instanceof Error ? error.message : "Unknown error"}`);
+      }
+    }
+
+    // ============================================================
+    // Phase 2: File Processing
+    // ============================================================
+    console.log(`[Download] Job ${jobId}: Phase 2 - Processing files (integrity check, compression, archiving)...`);
+    
+    // Verify integrity of all collected files
+    for (const file of tempFiles) {
+      const currentChecksum = calculateChecksum(file.data);
+      if (currentChecksum !== file.checksum) {
+        throw new Error(`Integrity check failed for file ${file.key}`);
+      }
+    }
+    
+    // Update progress (Phase 2: 25-50%)
+    job.progress = 30;
+    job.updatedAt = new Date();
+    
+    // Update SQLite
+    dbOperations.updateJob(jobId, {
+      progress: 30,
+      updatedAt: job.updatedAt,
+    });
+
+    // Create ZIP archive in memory
+    const archive = archiver("zip", {
+      zlib: { level: 6 }, // Compression level (0-9, 6 is balanced)
+    });
+
+    const archiveChunks: Buffer[] = [];
+    
+    // Set up event listeners BEFORE finalizing
+    const archivePromise = new Promise<Buffer>((resolve, reject) => {
+      archive.on("data", (chunk) => {
+        archiveChunks.push(chunk);
+      });
+      
+      archive.on("end", () => {
+        const archiveBuffer = Buffer.concat(archiveChunks);
+        resolve(archiveBuffer);
+      });
+      
+      archive.on("error", (err) => {
+        reject(err);
+      });
+    });
+
+    // Add all files to archive
+    for (const file of tempFiles) {
+      archive.append(file.data, { name: file.key });
+    }
+
+    // Finalize archive (triggers the events)
+    archive.finalize();
+    
+    // Wait for archive to complete
+    const archiveBuffer = await archivePromise;
+    
+    // Update progress (Phase 2 complete: 50%)
+    job.progress = 50;
+    job.updatedAt = new Date();
+    
+    // Update SQLite
+    dbOperations.updateJob(jobId, {
+      progress: 50,
+      updatedAt: job.updatedAt,
+    });
+    
+    console.log(`[Download] Job ${jobId}: Created archive (${archiveBuffer.length} bytes)`);
+
+    // ============================================================
+    // Phase 3: Upload to Storage
+    // ============================================================
+    console.log(`[Download] Job ${jobId}: Phase 3 - Uploading to downloads bucket...`);
+    
+    const finalKey = `${jobId}.zip`;
+    const uploadCommand = new PutObjectCommand({
+      Bucket: env.S3_BUCKET_NAME || "downloads",
+      Key: finalKey,
+      Body: archiveBuffer,
+      ContentType: "application/zip",
+      Metadata: {
+        jobId: jobId,
+        fileCount: String(fileKeys.length),
+        createdAt: new Date().toISOString(),
+      },
+    });
+
+    await s3Client.send(uploadCommand);
+    
+    // Update progress (Phase 3 complete: 75%)
+    job.progress = 75;
+    job.updatedAt = new Date();
+    
+    // Update SQLite
+    try {
+      dbOperations.updateJob(jobId, {
+        progress: 75,
+        updatedAt: job.updatedAt,
+      });
+    } catch (dbError) {
+      console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+    }
+    
+    console.log(`[Download] Job ${jobId}: Uploaded to downloads bucket (${finalKey})`);
+
+    // ============================================================
+    // Phase 4: Generate Download URL
+    // ============================================================
+    console.log(`[Download] Job ${jobId}: Phase 4 - Generating presigned download URL...`);
+    
+    const presignedCommand = new GetObjectCommand({
+      Bucket: env.S3_BUCKET_NAME || "downloads",
+      Key: finalKey,
+    });
+
+    // Generate presigned URL using browser-accessible client (valid for 1 hour)
+    // This ensures the URL works in browsers with correct signature
+    const downloadUrl = await getSignedUrl(browserS3Client, presignedCommand, { expiresIn: 3600 });
+    
+    // Update progress (Phase 4 complete: 100%)
+    job.status = "completed";
+    job.progress = 100;
+    job.downloadUrl = downloadUrl;
+    job.updatedAt = new Date();
+    
+    // Update SQLite
+    try {
+      dbOperations.updateJob(jobId, {
+        status: "completed",
+        progress: 100,
+        downloadUrl: downloadUrl,
+        updatedAt: job.updatedAt,
+      });
+    } catch (dbError) {
+      console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+    }
+
+    console.log(`[Download] Job ${jobId} completed successfully. Download URL generated.`);
+  } catch (error) {
+    job.status = "failed";
+    job.error = error instanceof Error ? error.message : "Unknown error";
+    job.updatedAt = new Date();
+    
+    // Update SQLite
+    try {
+      dbOperations.updateJob(jobId, {
+        status: "failed",
+        error: job.error,
+        updatedAt: job.updatedAt,
+      });
+    } catch (dbError) {
+      console.error(`[Database] Failed to update job ${jobId}:`, dbError);
+    }
+    
+    console.error(`[Download] Job ${jobId} failed:`, error);
+    throw error;
+  } finally {
+    // Cleanup: Clear temporary files from memory
+    tempFiles.length = 0;
+  }
+}
 
 app.openapi(downloadCheckRoute, async (c) => {
   const { sentry_test } = c.req.valid("query");
@@ -619,6 +991,310 @@ app.openapi(downloadStartRoute, async (c) => {
         message: `File not found after ${(processingTimeMs / 1000).toFixed(1)} seconds of processing`,
       },
       200,
+    );
+  }
+});
+
+// List files from source bucket
+const listSourceFilesRoute = createRoute({
+  method: "get",
+  path: "/v1/files",
+  tags: ["Files"],
+  summary: "List files from source bucket",
+  description: "Returns a list of all files available in the source bucket",
+  responses: {
+    200: {
+      description: "List of files",
+      content: {
+        "application/json": {
+          schema: z.object({
+            files: z.array(
+              z.object({
+                key: z.string(),
+                size: z.number().int(),
+                lastModified: z.string(),
+              }),
+            ),
+          }),
+        },
+      },
+    },
+  },
+});
+
+app.openapi(listSourceFilesRoute, async (c) => {
+  try {
+    const command = new ListObjectsV2Command({
+      Bucket: "source",
+    });
+    const response = await s3Client.send(command);
+    const files =
+      response.Contents?.map((obj) => ({
+        key: obj.Key ?? "",
+        size: obj.Size ?? 0,
+        lastModified: obj.LastModified?.toISOString() ?? new Date().toISOString(),
+      })).filter((f) => f.key && !f.key.endsWith("/")) ?? [];
+
+    return c.json({ files }, 200);
+  } catch (error) {
+    console.error("Error listing files:", error);
+    return c.json({ error: "Failed to list files", files: [] }, 500);
+  }
+});
+
+// Generate presigned URL for download
+const getDownloadUrlRoute = createRoute({
+  method: "get",
+  path: "/v1/files/{key}/download",
+  tags: ["Files"],
+  summary: "Get presigned download URL",
+  description: "Generates a presigned URL for downloading a file",
+  request: {
+    params: z.object({
+      key: z.string().openapi({ description: "File key in source bucket" }),
+    }),
+    query: z.object({
+      expiresIn: z.coerce.number().int().min(60).max(3600).default(3600).optional(),
+    }),
+  },
+  responses: {
+    200: {
+      description: "Presigned URL",
+      content: {
+        "application/json": {
+          schema: z.object({
+            url: z.string().url(),
+            expiresIn: z.number().int(),
+          }),
+        },
+      },
+    },
+  },
+});
+
+app.openapi(getDownloadUrlRoute, async (c) => {
+  const { key } = c.req.valid("param");
+  const { expiresIn = 3600 } = c.req.valid("query");
+
+  try {
+    const sanitizedKey = decodeURIComponent(key).replace(/\.\./g, "").replace(/^\//, "");
+    const command = new GetObjectCommand({
+      Bucket: "source",
+      Key: sanitizedKey,
+    });
+    const url = await getSignedUrl(s3Client, command, { expiresIn });
+    return c.json({ url, expiresIn }, 200);
+  } catch (error) {
+    console.error("Error generating presigned URL:", error);
+    return c.json({ error: "Failed to generate download URL" }, 500);
+  }
+});
+
+// Batch download URLs
+const batchDownloadRoute = createRoute({
+  method: "post",
+  path: "/v1/files/batch-download",
+  tags: ["Files"],
+  summary: "Get multiple presigned URLs",
+  description: "Generates presigned URLs for multiple files",
+  request: {
+    body: {
+      content: {
+        "application/json": {
+          schema: z.object({
+            keys: z.array(z.string()).min(1).max(50),
+            expiresIn: z.coerce.number().int().min(60).max(3600).default(3600).optional(),
+          }),
+        },
+      },
+    },
+  },
+  responses: {
+    200: {
+      description: "Presigned URLs",
+      content: {
+        "application/json": {
+          schema: z.object({
+            urls: z.array(
+              z.object({
+                key: z.string(),
+                url: z.string().url(),
+              }),
+            ),
+          }),
+        },
+      },
+    },
+  },
+});
+
+app.openapi(batchDownloadRoute, async (c) => {
+  const { keys, expiresIn = 3600 } = c.req.valid("json");
+  try {
+    const urls = await Promise.all(
+      keys.map(async (key) => {
+        const sanitizedKey = decodeURIComponent(key).replace(/\.\./g, "").replace(/^\//, "");
+        const command = new GetObjectCommand({
+          Bucket: "source",
+          Key: sanitizedKey,
+        });
+        const url = await getSignedUrl(s3Client, command, { expiresIn });
+        return { key, url };
+      }),
+    );
+    return c.json({ urls }, 200);
+  } catch (error) {
+    console.error("Error generating batch URLs:", error);
+    return c.json({ error: "Failed to generate download URLs" }, 500);
+  }
+});
+
+// SSE endpoint for progress updates
+app.get("/v1/download/subscribe/:jobId", async (c) => {
+  const jobId = c.req.param("jobId");
+  
+  return streamSSE(c, async (stream) => {
+    // Try memory cache first, then SQLite
+    let job = jobs.get(jobId);
+    if (!job) {
+      job = dbOperations.getJob(jobId);
+      if (job) {
+        jobs.set(jobId, job);
+      }
+    }
+    if (!job) {
+      await stream.writeSSE({
+        event: "error",
+        data: JSON.stringify({ error: "Job not found" }),
+      });
+      return;
+    }
+
+    // Send initial status
+    await stream.writeSSE({
+      event: "progress",
+      data: JSON.stringify({
+        jobId: job.jobId,
+        status: job.status,
+        progress: job.progress,
+        filesCompleted: job.filesCompleted,
+        totalFiles: job.totalFiles,
+      }),
+    });
+
+    // Poll for updates
+    let lastProgress = job.progress;
+    let lastStatus = job.status;
+    const interval = setInterval(async () => {
+      const currentJob = jobs.get(jobId);
+      if (!currentJob) {
+        clearInterval(interval);
+        return;
+      }
+
+      // Send update if progress or status changed
+      if (currentJob.progress !== lastProgress || currentJob.status !== lastStatus) {
+        const eventType = currentJob.status === "completed" ? "complete" : 
+                         currentJob.status === "failed" ? "error" : "progress";
+        
+        await stream.writeSSE({
+          event: eventType,
+          data: JSON.stringify({
+            jobId: currentJob.jobId,
+            status: currentJob.status,
+            progress: currentJob.progress,
+            filesCompleted: currentJob.filesCompleted,
+            totalFiles: currentJob.totalFiles,
+            downloadUrl: currentJob.downloadUrl,
+            error: currentJob.error,
+          }),
+        });
+        lastProgress = currentJob.progress;
+        lastStatus = currentJob.status;
+
+        // Close connection if completed or failed
+        if (currentJob.status === "completed" || currentJob.status === "failed") {
+          clearInterval(interval);
+        }
+      }
+    }, 1000); // Check every second
+
+    // Cleanup on client disconnect
+    c.req.raw.signal.addEventListener("abort", () => {
+      clearInterval(interval);
+    });
+  });
+});
+
+// Status endpoint for polling
+app.get("/v1/download/status/:jobId", (c) => {
+  const jobId = c.req.param("jobId");
+  const job = jobs.get(jobId);
+  
+  if (!job) {
+    return c.json({ error: "Job not found" }, 404);
+  }
+
+  return c.json({
+    jobId: job.jobId,
+    status: job.status,
+    progress: job.progress,
+    filesCompleted: job.filesCompleted,
+    totalFiles: job.totalFiles,
+    downloadUrl: job.downloadUrl, // Presigned S3 URL - browser should redirect to this when status is "completed"
+    error: job.error,
+    createdAt: job.createdAt.toISOString(),
+    updatedAt: job.updatedAt.toISOString(),
+  });
+});
+
+// Proxy download endpoint - streams file from S3 to browser
+app.get("/v1/download/file/:jobId", async (c) => {
+  const jobId = c.req.param("jobId");
+  const job = jobs.get(jobId);
+
+  if (!job) {
+    return c.json({ error: "Not Found", message: `Job ${jobId} not found` }, 404);
+  }
+
+  if (job.status !== "completed") {
+    return c.json({ error: "Bad Request", message: `Job ${jobId} is not completed yet` }, 400);
+  }
+
+  try {
+    const finalKey = `${jobId}.zip`;
+    const getCommand = new GetObjectCommand({
+      Bucket: env.S3_BUCKET_NAME || "downloads",
+      Key: finalKey,
+    });
+
+    const response = await s3Client.send(getCommand);
+
+    if (!response.Body) {
+      return c.json({ error: "Internal Server Error", message: "File not found in storage" }, 500);
+    }
+
+    // Convert Readable stream to a proper Response
+    const stream = response.Body as Readable;
+    
+    // Set headers for file download - use c.body() with headers in third parameter
+    const headers: Record<string, string> = {
+      "Content-Type": "application/zip",
+      "Content-Disposition": `attachment; filename="${jobId}.zip"`,
+      "Cache-Control": "no-cache",
+    };
+    
+    if (response.ContentLength) {
+      headers["Content-Length"] = String(response.ContentLength);
+    }
+
+    // Return the stream with proper headers - browser will trigger download
+    return c.body(stream, 200, headers);
+  } catch (error) {
+    console.error(`[Download] Failed to stream file for job ${jobId}:`, error);
+    return c.json(
+      { error: "Internal Server Error", message: "Failed to download file" },
+      500,
     );
   }
 });

@@ -9,6 +9,7 @@ services:
       - "3000:3000"
     volumes:
       - ../src:/app/src
+      - ../data:/app/data
     env_file:
       - ../.env
     environment:
@@ -51,8 +52,34 @@ services:
       /bin/sh -c "
       mc alias set myminio http://delineate-minio:9000 minioadmin minioadmin;
       mc mb myminio/downloads --ignore-existing;
+      mc mb myminio/source --ignore-existing;
       mc anonymous set download myminio/downloads;
-      echo 'Bucket created successfully';
+      echo 'Buckets created successfully';
+      exit 0;
+      "
+
+  delineate-minio-populate:
+    image: minio/mc:latest
+    depends_on:
+      delineate-minio:
+        condition: service_healthy
+      delineate-minio-init:
+        condition: service_completed_successfully
+    volumes:
+      - /tmp/delineate-source-files:/source-files:ro
+    entrypoint: >
+      /bin/sh -c "
+      echo 'Waiting for MinIO to be ready...';
+      sleep 3;
+      mc alias set myminio http://delineate-minio:9000 minioadmin minioadmin;
+      echo 'Checking if source bucket exists...';
+      mc ls myminio/source/ 2>/dev/null || mc mb myminio/source;
+      echo 'Uploading source files to source bucket...';
+      mc cp /source-files/file_*.zip myminio/source/ 2>/dev/null || echo 'No zip files found';
+      mc cp /source-files/README.txt myminio/source/ 2>/dev/null || echo 'No README found';
+      echo 'Source bucket populated successfully!';
+      echo 'Files in source bucket:';
+      mc ls myminio/source/;
       exit 0;
       "
 
@@ -63,6 +90,26 @@ services:
       - "4318:4318"
     environment:
       - COLLECTOR_OTLP_ENABLED=true
+
+  delineate-external-application:
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile.dev
+    ports:
+      - "5173:5173"
+    environment:
+      - VITE_API_URL=http://localhost:3000
+      - VITE_MINIO_ENDPOINT=http://localhost:9000
+      - VITE_MINIO_ACCESS_KEY=minioadmin
+      - VITE_MINIO_SECRET_KEY=minioadmin
+      - VITE_SOURCE_BUCKET=source
+    volumes:
+      - ../../frontend:/app
+      - /app/node_modules
+    depends_on:
+      delineate-minio:
+        condition: service_healthy
+    command: npm run dev -- --host
 
 volumes:
   minio-data:
