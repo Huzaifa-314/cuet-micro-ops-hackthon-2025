@@ -8,6 +8,9 @@ RUN npm install
 
 COPY . .
 
+# Create empty .env file if it doesn't exist (env vars are injected by docker-compose)
+RUN touch .env || true
+
 EXPOSE 3000
 
 CMD ["npm", "run", "dev"]
