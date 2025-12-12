@@ -526,6 +526,68 @@ npm run docker:dev   # Start with Docker (development)
 npm run docker:prod  # Start with Docker (production)
 ```
 
+## CI/CD Pipeline
+
+[![CI/CD Pipeline](https://github.com/Huzaifa-314/cuet-micro-ops-hackthon-2025/actions/workflows/ci.yml/badge.svg)](https://github.com/Huzaifa-314/cuet-micro-ops-hackthon-2025/actions/workflows/ci.yml)
+
+### Pipeline Stages
+
+```
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│    Lint     │───▶│    Test     │───▶│    Build    │───▶│   Deploy    │
+│  (ESLint,   │    │   (E2E)     │    │  (Docker)   │    │  (Ubuntu)   │
+│  Prettier)  │    │             │    │             │    │             │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
+```
+
+### For Contributors
+
+1. **Before pushing**, run tests locally:
+   ```bash
+   npm run lint
+   npm run format:check
+   npm run test:e2e
+   ```
+
+2. **Create a pull request** - CI will run automatically
+3. **Merge only after** all checks pass
+
+### Running Tests Locally
+
+```bash
+# Install dependencies
+npm install
+
+# Run linting
+npm run lint
+
+# Check formatting
+npm run format:check
+
+# Run E2E tests
+npm run test:e2e
+
+# Fix linting issues
+npm run lint:fix
+
+# Format code
+npm run format
+```
+
+### Deployment
+
+The pipeline automatically deploys to the Ubuntu server when code is pushed to the `main` branch. The deployment process:
+
+1. Builds and pushes Docker image to GitHub Container Registry
+2. Copies files to the server via SSH
+3. Runs `docker compose` to update the running services
+
+**Required GitHub Secrets:**
+- `SERVER_HOST` - Server IP or hostname
+- `SERVER_USER` - SSH username (usually `ubuntu`)
+- `SERVER_SSH_KEY` - Private SSH key for authentication
+- `SERVER_DEPLOY_PATH` - Deployment directory path
+
 ## Project Structure
 
 ```

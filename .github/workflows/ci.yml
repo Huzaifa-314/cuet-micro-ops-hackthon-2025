@@ -1,4 +1,4 @@
-name: CI
+name: CI/CD Pipeline
 
 on:
   push:
@@ -6,45 +6,82 @@ on:
   pull_request:
     branches: [main, master]
 
+env:
+  NODE_VERSION: '24'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 jobs:
   lint:
-    name: Lint
+    name: 🔍 Lint & Format Check
     runs-on: ubuntu-24.04
-    container:
-      image: node:24-slim
     steps:
-      - name: Checkout
+      - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📥 Install dependencies
         run: npm ci
 
-      - name: Run ESLint
+      - name: 🔍 Run ESLint
         run: npm run lint
 
-      - name: Check formatting
+      - name: 💅 Check formatting
         run: npm run format:check
 
   test:
-    name: E2E Tests
+    name: 🧪 E2E Tests
     runs-on: ubuntu-24.04
     needs: lint
-    container:
-      image: node:24-slim
+    services:
+      minio:
+        image: minio/minio:latest
+        ports:
+          - 9000:9000
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: >-
+          --health-cmd "mc ready local"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
-      - name: Checkout
+      - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: 📦 Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: 📥 Install dependencies
         run: npm ci
 
-      - name: Run E2E tests
+      - name: 🪣 Create MinIO bucket
+        run: |
+          wget -q https://dl.min.io/client/mc/release/linux-amd64/mc
+          chmod +x mc
+          ./mc alias set myminio http://localhost:9000 minioadmin minioadmin
+          ./mc mb myminio/downloads --ignore-existing
+
+      - name: 🧪 Run E2E tests
         run: npm run test:e2e
         env:
-          NODE_ENV: development
+          NODE_ENV: test
           PORT: 3000
           S3_REGION: us-east-1
-          S3_BUCKET_NAME: ""
+          S3_ENDPOINT: http://localhost:9000
+          S3_ACCESS_KEY_ID: minioadmin
+          S3_SECRET_ACCESS_KEY: minioadmin
+          S3_BUCKET_NAME: downloads
           S3_FORCE_PATH_STYLE: "true"
           SENTRY_DSN: ""
           OTEL_EXPORTER_OTLP_ENDPOINT: ""
@@ -54,22 +91,78 @@ jobs:
           CORS_ORIGINS: "*"
 
   build:
-    name: Build Docker Image
+    name: 🐳 Build Docker Image
     runs-on: ubuntu-24.04
     needs: test
+    permissions:
+      contents: read
+      packages: write
     steps:
-      - name: Checkout
+      - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
+      - name: 🐳 Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: 🔐 Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 📋 Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=
+            type=ref,event=branch
+            type=ref,event=pr
+
+      - name: 🏗️ Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: docker/Dockerfile.prod
-          push: false
-          tags: delineate-hackathon-challenge:${{ github.sha }}
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  deploy:
+    name: 🚀 Deploy to Ubuntu Server
+    runs-on: ubuntu-24.04
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    steps:
+      - name: 📥 Checkout code
+        uses: actions/checkout@v4
+
+      - name: 🔐 Setup SSH
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.SERVER_SSH_KEY }}
+
+      - name: 🔧 Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H ${{ secrets.SERVER_HOST }} >> ~/.ssh/known_hosts || true
+
+      - name: 📦 Copy files to server
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
+            "mkdir -p ${{ secrets.SERVER_DEPLOY_PATH }}"
+          scp -r ./* ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:${{ secrets.SERVER_DEPLOY_PATH }}/
+
+      - name: 🐳 Deploy on server
+        run: |
+          ssh -o StrictHostKeyChecking=no ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} << 'EOF'
+            cd ${{ secrets.SERVER_DEPLOY_PATH }}/cuet-micro-ops-hackthon-2025
+            docker compose -f docker/compose.prod.yml down || true
+            docker compose -f docker/compose.prod.yml pull || true
+            docker compose -f docker/compose.prod.yml up -d --build
+          EOF
